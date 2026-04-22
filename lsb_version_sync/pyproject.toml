@@ -1,0 +1,29 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "lsb-version-sync"
+version = "0.1.0"
+description = "Auto-match the retail FFXI CLIENT_VER string into LandSandBoat's login.lua (fixes FFXI-3331 on every retail patch)."
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "MIT" }
+authors = [{ name = "Chharbot / Claude" }]
+classifiers = [
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Operating System :: Microsoft :: Windows",
+    "Topic :: Games/Entertainment :: Role-Playing",
+]
+dependencies = []   # stdlib-only by design; psutil is optional
+
+[project.optional-dependencies]
+proc = ["psutil>=5.9"]
+test = ["pytest>=7"]
+
+[project.scripts]
+lsb-version-sync = "lsb_version_sync.__main__:main"
+
+[tool.setuptools.packages.find]
+include = ["lsb_version_sync*"]

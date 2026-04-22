@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Reference copy of F:\ffxi\Ashita\config\boot\Private Server.xml after the
+  2026-04-20 auth fix. This is the STATE AT THE END OF THIS SESSION, not the
+  final recommended state.
+
+  - boot_file has been re-pointed at the upgraded xiloader 2.1.1. This makes
+    xiloader authenticate successfully, but Ashita's injector still fails
+    because xiloader isn't an injectable target.
+
+  - The recommended final state (see docs/ASHITA-INTEGRATION.md) points
+    boot_file at the retail pol.exe and uses an Ashita addon (xiloader_fixed
+    or equivalent) to handle the handshake.
+-->
+<settings>
+    <setting name="config_name">Altana</setting>
+    <setting name="boot_file">F:\ffxi\Ashita\ffxi-bootmod\pol.exe</setting>
+    <setting name="boot_command">--server 127.0.0.1</setting>
+</settings>

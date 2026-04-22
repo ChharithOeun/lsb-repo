@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "chharbot"
+version = "0.1.0"
+description = "Local-model agent that drives the FFXI / LandSandBoat AI-control stack"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "Chharbot / Claude" }]
+dependencies = []
+
+[project.optional-dependencies]
+test = ["pytest>=7"]
+
+[project.scripts]
+chharbot = "chharbot.__main__:main"
+
+[tool.setuptools.packages.find]
+include = ["chharbot*"]
+exclude = ["tests*"]

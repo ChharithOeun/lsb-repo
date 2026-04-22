@@ -1,0 +1,31 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+dist/
+build/
+.venv/
+venv/
+
+# Editors
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Tokens (never commit!)
+.lsb_admin_token
+.aibridge_token
+.env
+.env.*
+*.pem
+*.key
+
+# Deploy-local artifacts
+*.log
+*.tmp
+*.bak
+*.ver-sync-bak.*

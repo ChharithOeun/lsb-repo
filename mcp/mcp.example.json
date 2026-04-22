@@ -1,0 +1,44 @@
+{
+  "mcpServers": {
+    "ffxi_client": {
+      "command": "python",
+      "args": [
+        "F:/ffxi/deploy/repo/mcp/ffxi_client/server.py"
+      ],
+      "env": {
+        "AI_BRIDGE_HOST": "127.0.0.1",
+        "AI_BRIDGE_PORT": "27115",
+        "AI_BRIDGE_TIMEOUT": "3.0"
+      }
+    },
+    "ffxi_admin": {
+      "command": "python",
+      "args": [
+        "F:/ffxi/deploy/repo/mcp/ffxi_admin/server.py"
+      ],
+      "env": {
+        "LSB_ADMIN_HOST": "127.0.0.1",
+        "LSB_ADMIN_PORT": "27116",
+        "LSB_ADMIN_TOKEN_FILE": "F:/ffxi/deploy/.lsb_admin_token",
+        "LSB_ADMIN_TIMEOUT": "5.0"
+      }
+    },
+    "ffxi_chharbot": {
+      "command": "python",
+      "args": [
+        "F:/ffxi/deploy/repo/mcp/ffxi_chharbot/server.py"
+      ],
+      "env": {
+        "CHHARBOT_BACKEND":          "ollama",
+        "CHHARBOT_MODEL":            "llama3.1:8b-instruct-q4_K_M",
+        "CHHARBOT_LLM_URL":          "http://127.0.0.1:11434",
+        "CHHARBOT_ALLOW_WRITES":     "0",
+        "LSB_ADMIN_URL":             "http://127.0.0.1:27116",
+        "LSB_ADMIN_TOKEN_FILE":      "F:/ffxi/deploy/.lsb_admin_token",
+        "LSB_AIBRIDGE_TOKEN_FILE":   "F:/ffxi/deploy/.aibridge_token",
+        "AI_BRIDGE_HOST":            "127.0.0.1",
+        "AI_BRIDGE_PORT":            "27115"
+      }
+    }
+  }
+}
