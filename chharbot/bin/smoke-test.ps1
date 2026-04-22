@@ -20,6 +20,7 @@ param(
     [string]$Backend        = 'ollama',
     [string]$LlmUrl         = 'http://127.0.0.1:11434',
     [string]$DeployRoot     = 'F:\ffxi\deploy',
+    [string]$AshitaRoot     = 'F:\ffxi\Ashita',
     [switch]$PullIfMissing,
     [switch]$NoOllama,       # skip ollama plumbing (use with external/openai backend)
     [switch]$AllowWrites
@@ -105,7 +106,22 @@ function Test-Tcp($hostname, $port, $timeoutMs = 1500) {
 
 $aiUp    = Test-Tcp '127.0.0.1' 27115
 $adminUp = Test-Tcp '127.0.0.1' 27116
-Say ("  ai_bridge      : {0}" -f ($(if ($aiUp)    { 'up' } else { 'down' }))) ($(if ($aiUp)    { 'Green' } else { 'DarkYellow' }))
+
+# Disambiguate "ai_bridge down" -- it's a Lua addon that only listens when
+# FFXI is running with /addon load ai_bridge. A "down" reading is expected
+# unless the game is live. We distinguish three states:
+#   up                     : listener responding on 27115
+#   down (addon missing)   : addon file not staged to Ashita -- real deploy bug
+#   down (game offline)    : addon staged, but FFXI not running -- expected
+$aiState = if ($aiUp) { 'up' } else {
+    $addonLua = Join-Path $AshitaRoot 'addons\ai_bridge\ai_bridge.lua'
+    if (Test-Path -LiteralPath $addonLua) {
+        'down (game offline -- start FFXI + /addon load ai_bridge to exercise)'
+    } else {
+        'down (addon not staged at ' + $addonLua + ' -- run deploy-full-stack.ps1)'
+    }
+}
+Say ("  ai_bridge      : {0}" -f $aiState) ($(if ($aiUp) { 'Green' } else { 'DarkYellow' }))
 Say ("  lsb_admin_api  : {0}" -f ($(if ($adminUp) { 'up' } else { 'down' }))) ($(if ($adminUp) { 'Green' } else { 'DarkYellow' }))
 if (-not $adminUp) { Die "lsb_admin_api sidecar is required for smoke test." }
 
