@@ -113,9 +113,29 @@ $ghUser = $null
 foreach ($k in 'GITHUB_USER','GH_USER','GITHUB_USERNAME') {
     if ($envMap.ContainsKey($k) -and $envMap[$k]) { $ghUser = $envMap[$k]; break }
 }
+# Target repo resolution.
+# Priority order:
+#   1. LSB_REPO_NAME in .env (explicit override for this repo)
+#   2. GITHUB_REPO/GH_REPO/REPO_NAME - ONLY if the .env is inside $RepoRoot
+#      (otherwise we're using a foreign .env just for its PAT, and its
+#      GITHUB_REPO points at that project's own repo, not ours)
+#   3. Default: 'lsb-repo'
 $ghRepoName = $null
-foreach ($k in 'GITHUB_REPO','GH_REPO','REPO_NAME') {
-    if ($envMap.ContainsKey($k) -and $envMap[$k]) { $ghRepoName = $envMap[$k]; break }
+if ($envMap.ContainsKey('LSB_REPO_NAME') -and $envMap['LSB_REPO_NAME']) {
+    $ghRepoName = $envMap['LSB_REPO_NAME']
+}
+$envInRepo = $envPath -like (Join-Path $RepoRoot '*')
+if (-not $ghRepoName -and $envInRepo) {
+    foreach ($k in 'GITHUB_REPO','GH_REPO','REPO_NAME') {
+        if ($envMap.ContainsKey($k) -and $envMap[$k]) { $ghRepoName = $envMap[$k]; break }
+    }
+    # If it was a full URL, reduce to bare repo name.
+    if ($ghRepoName -and $ghRepoName -match '(?:https?://github\.com/|git@github\.com:)([^/]+)/([^/]+?)(?:\.git)?/?$') {
+        $ghRepoName = $Matches[2]
+    }
+}
+if (-not $envInRepo) {
+    Write-Host "  (using external .env - only its PAT/user; target repo = 'lsb-repo')" -ForegroundColor DarkYellow
 }
 
 # Probe /user to get the username if we don't have it.
