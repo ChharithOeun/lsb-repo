@@ -34,3 +34,11 @@ Analysis, Token Cost, Doctrine Update, Recommendations).
   that read credentials should probe that path first, then widen.
 
 **Report:** AAR/reports/LL-2026-04-21-001.pdf
+
+## LL-2026-04-23-001 - ai_bridge Lua addon rewrite: Ashita v4 to v3 classic API
+**Date:** 2026-04-23 | **Level:** SIGNIFICANT
+**Key Lessons:**
+- Ashita v3 classic uses _addon.name + ashita.register_event; v4 uses addon.name + ashita.events.register. Silent stalls at load stage 2/3 when mismatched.
+- When an addon has NO console/chat output, a file-based io.open() trace log at each step is the fastest diagnostic path.
+- Before coding any new Ashita Lua addon, dump a known-working addon (distance.lua, tparty.lua) first to confirm which API flavor the runtime expects.
+**Report:** AAR/reports/LL-2026-04-23-001.pdf
