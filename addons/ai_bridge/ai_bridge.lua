@@ -1,447 +1,310 @@
 --[[
-ai_bridge - client-side FFXI state & control bridge for Chharbot / Claude.
-
-This Ashita v3 addon runs inside the FFXI game process and opens a plain-TCP
-JSON-RPC 2.0 listener on 127.0.0.1:27115. The mcp_ffxi_client MCP (see
-mcp/ffxi_client/server.py) forwards MCP tool calls to this listener as
-newline-delimited JSON requests.
-
-Wire format: each request and each response is ONE line of JSON. Any message
-without a trailing newline is buffered until the newline arrives.
-
-Supported methods (minimum viable set):
-  - get_state        { }         -> snapshot of player + target + zone
-  - get_chat_tail    { n }       -> last N chat lines
-  - get_entities     { radius }  -> entities within yalms
-  - get_inventory    { bag }     -> items in bag (or all bags)
-  - send_text        { text }    -> types into the chat input
-  - target           { entity_id }
-  - face             { yaw }
-  - subscribe        { events }  -> server pushes event lines on same socket
-  - ping             { }         -> health check
-
-Notes:
-  - Binds localhost only. Add a token in settings/settings.lua if you need auth.
-  - Failure mode: if a listener call throws, the error is returned as JSON-RPC
-    error and the addon keeps running. The socket is non-blocking so the
-    game loop is never stalled.
-  - Push events flow on the same connection that called `subscribe`; each
-    event is its own JSON line starting with `{"event":"..."}`.
+ai_bridge (Ashita v3 classic rewrite)
+TCP JSON-RPC listener on 127.0.0.1:27115 for Chharbot.
+Uses ONLY the Ashita v3 classic API: _addon, ashita.register_event,
+require('json.json'), require('socket'), AshitaCore:GetDataManager().
 ]]
 
-addon.name      = 'ai_bridge'
-addon.author    = 'Chharbot / Claude'
-addon.version   = '0.1.0'
-addon.desc      = 'Exposes FFXI client state and control to Chharbot over localhost JSON-RPC.'
+_addon.author   = 'Chharbot / Claude';
+_addon.name     = 'ai_bridge';
+_addon.version  = '0.2.0';
 
-require('common')
-local chat   = require('chat')
-local socket = require('socket')
+require 'common'
 
--------------------------------------------------------------------------------
--- Settings
--------------------------------------------------------------------------------
-local default_settings = T{
-    host    = '127.0.0.1',
-    port    = 27115,
-    token   = '',              -- if non-empty, clients must send {"auth":"<token>"} first
-    backlog = 4,
-    chat_tail_max = 200,
-    max_clients   = 4,         -- DoS cap on concurrent connections
-    rate_limit_n  = 30,        -- max calls per window
-    rate_limit_w  = 1.0,       -- window seconds
-    max_entities_radius = 50,  -- cap get_entities radius; prevent scan abuse
-}
-
-local settings = default_settings:copy(true)
-do
-    local ok, s = pcall(require, 'settings')
-    if ok then
-        settings = s.load(default_settings)
-        s.register('settings', 'settings_update', function(v) settings:update(v, true) end)
+-- ---------------------------------------------------------------------------
+-- Trace log helper (writes to Ashita\logs\ai_bridge_trace.log)
+-- ---------------------------------------------------------------------------
+local function trace(msg)
+    local ok, f = pcall(io.open, 'F:\\ffxi\\Ashita\\logs\\ai_bridge_trace.log', 'a')
+    if ok and f then
+        f:write(os.date('%Y-%m-%d %H:%M:%S ') .. tostring(msg) .. '\n')
+        f:close()
     end
 end
 
--------------------------------------------------------------------------------
+trace('--- ai_bridge top-level start ---')
+
+-- ---------------------------------------------------------------------------
+-- Requires (guarded)
+-- ---------------------------------------------------------------------------
+local ok_sock, socket = pcall(require, 'socket')
+trace('require socket => ok=' .. tostring(ok_sock) .. ' type=' .. type(socket))
+if not ok_sock then trace('socket err: ' .. tostring(socket)) end
+
+local ok_json, json = pcall(require, 'json.json')
+trace('require json.json => ok=' .. tostring(ok_json) .. ' type=' .. type(json))
+
+-- ---------------------------------------------------------------------------
+-- Settings
+-- ---------------------------------------------------------------------------
+local settings = {
+    host          = '127.0.0.1',
+    port          = 27115,
+    backlog       = 4,
+    max_clients   = 4,
+    chat_tail_max = 200,
+    max_entities_radius = 50,
+}
+
+-- ---------------------------------------------------------------------------
 -- State
--------------------------------------------------------------------------------
+-- ---------------------------------------------------------------------------
 local state = {
-    listener  = nil,               -- server socket
-    clients   = {},                -- array of { sock = ..., buf = '', subscribed = {event=true} }
-    chat_tail = {},                -- ring buffer of recent chat lines
+    listener  = nil,
+    clients   = {},    -- array of { sock = s, buf = '' }
+    chat_tail = {},    -- ring of recent chat lines
     running   = false,
 }
 
--- JSON shim - Ashita ships a small json lib; fall back to a minimal encoder.
-local json
-do
-    local ok, j = pcall(require, 'json')
-    if ok then json = j end
+-- ---------------------------------------------------------------------------
+-- JSON encode/decode shim
+-- ---------------------------------------------------------------------------
+local function encode(v)
+    if ok_json and json and json.encode then
+        local ok, s = pcall(function() return json:encode(v) end)
+        if ok then return s end
+    end
+    -- Fallback: minimal encoder for primitives / flat tables
+    if v == nil then return 'null' end
+    local t = type(v)
+    if t == 'number' or t == 'boolean' then return tostring(v) end
+    if t == 'string' then return '"' .. v:gsub('\\', '\\\\'):gsub('"', '\\"'):gsub('\n', '\\n') .. '"' end
+    if t == 'table' then
+        -- check if array-like
+        local is_arr = (#v > 0)
+        local parts = {}
+        if is_arr then
+            for i = 1, #v do parts[#parts+1] = encode(v[i]) end
+            return '[' .. table.concat(parts, ',') .. ']'
+        else
+            for k, val in pairs(v) do
+                parts[#parts+1] = '"' .. tostring(k) .. '":' .. encode(val)
+            end
+            return '{' .. table.concat(parts, ',') .. '}'
+        end
+    end
+    return '"' .. tostring(v) .. '"'
 end
 
-local function encode(v) if json then return json.encode(v) end return tostring(v) end
-local function decode(s) if json then return json.decode(s) end return nil end
+local function decode(s)
+    if ok_json and json and json.decode then
+        local ok, v = pcall(function() return json:decode(s) end)
+        if ok then return v end
+    end
+    return nil
+end
 
--------------------------------------------------------------------------------
--- Helpers - read game state via Ashita APIs
--------------------------------------------------------------------------------
+-- ---------------------------------------------------------------------------
+-- Game state readers (Ashita v3 DataManager API)
+-- ---------------------------------------------------------------------------
+local function safe_call(fn, ...)
+    local ok, v = pcall(fn, ...)
+    if ok then return v end
+    return nil
+end
+
 local function player_state()
-    local party  = AshitaCore:GetMemoryManager():GetParty()
-    local player = AshitaCore:GetMemoryManager():GetPlayer()
-    local ent    = AshitaCore:GetMemoryManager():GetEntity()
-
-    local me_idx = party and party:GetMemberTargetIndex(0) or 0
-    local me_x   = me_idx > 0 and ent:GetLocalPositionX(me_idx) or 0.0
-    local me_y   = me_idx > 0 and ent:GetLocalPositionY(me_idx) or 0.0
-    local me_z   = me_idx > 0 and ent:GetLocalPositionZ(me_idx) or 0.0
-
-    local tgt_id = (AshitaCore:GetMemoryManager():GetTarget():GetServerId(0)) or 0
-
-    return {
-        name       = party and party:GetMemberName(0) or '?',
-        zone_id    = party and party:GetMemberZone(0) or 0,
-        hp         = party and party:GetMemberHP(0) or 0,
-        hp_max     = party and party:GetMemberHPMax(0) or 0,
-        mp         = party and party:GetMemberMP(0) or 0,
-        mp_max     = party and party:GetMemberMPMax(0) or 0,
-        tp         = party and party:GetMemberTP(0) or 0,
-        main_job   = player and player:GetMainJob() or 0,
-        sub_job    = player and player:GetSubJob() or 0,
-        main_level = player and player:GetMainJobLevel() or 0,
-        sub_level  = player and player:GetSubJobLevel() or 0,
-        x          = me_x, y = me_y, z = me_z,
-        target_id  = tgt_id,
+    local dm    = AshitaCore:GetDataManager()
+    local party = dm:GetParty()
+    local target = dm:GetTarget()
+    local player = dm:GetPlayer()
+    local out = {
+        name      = safe_call(function() return party:GetMemberName(0) end) or '?',
+        zone_id   = safe_call(function() return party:GetMemberZone(0) end) or 0,
+        hp        = safe_call(function() return party:GetMemberCurrentHP(0) end) or 0,
+        hp_max    = safe_call(function() return party:GetMemberMaxHP(0) end) or 0,
+        mp        = safe_call(function() return party:GetMemberCurrentMP(0) end) or 0,
+        mp_max    = safe_call(function() return party:GetMemberMaxMP(0) end) or 0,
+        tp        = safe_call(function() return party:GetMemberCurrentTP(0) end) or 0,
+        main_job  = safe_call(function() return player:GetMainJob() end) or 0,
+        sub_job   = safe_call(function() return player:GetSubJob() end) or 0,
+        main_level = safe_call(function() return player:GetMainJobLevel() end) or 0,
+        sub_level  = safe_call(function() return player:GetSubJobLevel() end) or 0,
+        target_id  = safe_call(function() return target:GetServerId() end) or 0,
+        target_name = safe_call(function() return target:GetName() end) or '',
     }
+    return out
 end
 
 local function entities_within(radius)
-    local ent = AshitaCore:GetMemoryManager():GetEntity()
-    local party = AshitaCore:GetMemoryManager():GetParty()
-    local me_idx = party and party:GetMemberTargetIndex(0) or 0
-    local ox = me_idx > 0 and ent:GetLocalPositionX(me_idx) or 0.0
-    local oy = me_idx > 0 and ent:GetLocalPositionY(me_idx) or 0.0
-    local oz = me_idx > 0 and ent:GetLocalPositionZ(me_idx) or 0.0
+    radius = math.min(radius or 30, settings.max_entities_radius)
+    local dm = AshitaCore:GetDataManager()
+    local entity = dm:GetEntity()
     local out = {}
     for i = 1, 2303 do
-        local name = ent:GetName(i)
+        local name = safe_call(function() return entity:GetName(i) end)
         if name and name ~= '' then
-            local x = ent:GetLocalPositionX(i)
-            local y = ent:GetLocalPositionY(i)
-            local z = ent:GetLocalPositionZ(i)
-            local dx, dy, dz = x - ox, y - oy, z - oz
-            local d = math.sqrt(dx*dx + dy*dy + dz*dz)
-            if d <= (radius or 30) then
-                out[#out+1] = {
-                    id   = ent:GetServerId(i),
-                    idx  = i,
-                    name = name,
-                    type = ent:GetSpawnFlags(i),
-                    hp_pct = ent:GetHPPercent(i),
-                    x = x, y = y, z = z, dist = d,
-                }
-            end
+            local hpp = safe_call(function() return entity:GetHPPercent(i) end) or 0
+            local sid = safe_call(function() return entity:GetServerId(i) end) or 0
+            out[#out+1] = { idx = i, id = sid, name = name, hp_pct = hpp }
+            if #out >= 128 then break end
         end
     end
     return out
 end
 
-local function inventory_items(bag)
-    local inv = AshitaCore:GetMemoryManager():GetInventory()
-    local res = AshitaCore:GetResourceManager()
+local function chat_tail(n)
+    n = math.min(n or 20, settings.chat_tail_max)
+    local start = math.max(1, #state.chat_tail - n + 1)
     local out = {}
-    local bags = bag and { bag } or { 0, 8, 10, 11, 12 } -- inventory + wardrobes
-    for _, b in ipairs(bags) do
-        local count = inv:GetContainerCountMax(b) or 0
-        for i = 0, count - 1 do
-            local it = inv:GetContainerItem(b, i)
-            if it and it.Id and it.Id ~= 0 then
-                local info = res:GetItemById(it.Id)
-                out[#out+1] = {
-                    bag   = b,
-                    slot  = i,
-                    item_id = it.Id,
-                    name  = info and info.Name[1] or '?',
-                    count = it.Count,
-                }
-            end
-        end
-    end
+    for i = start, #state.chat_tail do out[#out+1] = state.chat_tail[i] end
     return out
 end
 
--------------------------------------------------------------------------------
--- JSON-RPC dispatch
--------------------------------------------------------------------------------
+-- ---------------------------------------------------------------------------
+-- RPC dispatch
+-- ---------------------------------------------------------------------------
 local methods = {}
 
-methods.ping = function(_) return { pong = true, ts = os.time() } end
+methods.ping = function(params)
+    return { ok = true, ts = os.time() }
+end
 
-methods.get_state = function(_) return player_state() end
+methods.get_state = function(params)
+    return player_state()
+end
 
 methods.get_chat_tail = function(params)
     local n = (params and params.n) or 20
-    local first = math.max(1, #state.chat_tail - n + 1)
-    local out = {}
-    for i = first, #state.chat_tail do out[#out+1] = state.chat_tail[i] end
-    return out
+    return chat_tail(n)
 end
 
 methods.get_entities = function(params)
     local r = (params and params.radius) or 30
-    local cap = settings.max_entities_radius or 50
-    if r > cap then r = cap end
-    if r < 0 then r = 0 end
     return entities_within(r)
 end
 
-methods.get_inventory = function(params)
-    return inventory_items(params and params.bag)
-end
-
 methods.send_text = function(params)
-    if not params or type(params.text) ~= 'string' then
-        error('text: string required')
+    local txt = params and params.text or ''
+    if txt ~= '' then
+        local ok = pcall(function() AshitaCore:GetChatManager():QueueCommand(txt, 1) end)
+        return { ok = ok }
     end
-    local t = params.text
-    if #t > 400 then error('text: too long (>400 chars)') end
-    -- Strip CR/LF so a single send_text can't inject multiple chat lines.
-    t = t:gsub('[\r\n]', ' ')
-    AshitaCore:GetChatManager():QueueCommand(1, t)
-    return { ok = true }
+    return { ok = false, error = 'empty text' }
 end
 
 methods.target = function(params)
-    if not params or not params.entity_id then error('entity_id required') end
-    -- Ashita's target manager accepts server id or index; use /ta for simplicity.
-    AshitaCore:GetChatManager():QueueCommand(1, ('/ta <t> %s'):format(tostring(params.entity_id)))
-    return { ok = true }
+    -- server-id based targeting via /ta (if addon is loaded in xiloader build)
+    local id = params and params.entity_id
+    if not id then return { ok = false, error = 'missing entity_id' } end
+    local ok = pcall(function()
+        AshitaCore:GetChatManager():QueueCommand('/ta <' .. tostring(id) .. '>', 1)
+    end)
+    return { ok = ok }
 end
 
-methods.face = function(params)
-    if not params or not params.yaw then error('yaw required') end
-    -- Facing requires memory write; stubbed out - returns ok without acting.
-    return { ok = true, stub = true }
-end
+local function handle_request(raw)
+    local req = decode(raw)
+    local id  = (req and req.id) or 0
+    local method = req and req.method
+    local params = req and req.params
 
-methods.subscribe = function(params, client)
-    local events = params and params.events or { 'chat' }
-    client.subscribed = client.subscribed or {}
-    for _, ev in ipairs(events) do client.subscribed[ev] = true end
-    return { ok = true, events = events }
-end
-
--------------------------------------------------------------------------------
--- Connection handling
--------------------------------------------------------------------------------
-local function send_line(client, obj)
-    local line = encode(obj) .. '\n'
-    local ok, err = client.sock:send(line)
+    if not method then
+        return encode({ jsonrpc = '2.0', id = id, error = { code = -32600, message = 'invalid request' } })
+    end
+    local fn = methods[method]
+    if not fn then
+        return encode({ jsonrpc = '2.0', id = id, error = { code = -32601, message = 'method not found: ' .. tostring(method) } })
+    end
+    local ok, result = pcall(fn, params)
     if not ok then
-        client.dead = true
+        return encode({ jsonrpc = '2.0', id = id, error = { code = -32000, message = 'internal: ' .. tostring(result) } })
     end
+    return encode({ jsonrpc = '2.0', id = id, result = result })
 end
 
-local function rate_limited(client)
-    local now = os.time()
-    local w = settings.rate_limit_w or 1.0
-    if (now - (client.rl_window_start or now)) >= w then
-        client.rl_window_start = now
-        client.rl_count = 0
-    end
-    client.rl_count = (client.rl_count or 0) + 1
-    return client.rl_count > (settings.rate_limit_n or 30)
-end
-
-
-local function handle_request(client, req)
-    local rid = req.id
-    -- Handshake: `{"auth":"<token>"}` is allowed as a standalone message
-    -- before any method call. Everything else requires `authed`.
-    if req.auth ~= nil then
-        if settings.token == '' then
-            client.authed = true
-            send_line(client, { jsonrpc = '2.0', id = rid, result = { ok = true, note = 'no token configured' } })
-        elseif req.auth == settings.token then
-            client.authed = true
-            send_line(client, { jsonrpc = '2.0', id = rid, result = { ok = true } })
-        else
-            send_line(client, { jsonrpc = '2.0', id = rid,
-                error = { code = -32002, message = 'invalid token' } })
-            client.dead = true
-        end
+-- ---------------------------------------------------------------------------
+-- Load event: bind listener
+-- ---------------------------------------------------------------------------
+ashita.register_event('load', function()
+    trace('load event fired')
+    if not ok_sock or not socket or type(socket.bind) ~= 'function' then
+        trace('abort: socket lib not usable')
         return
     end
-    if not client.authed then
-        send_line(client, { jsonrpc = '2.0', id = rid,
-            error = { code = -32001, message = 'unauthenticated: send {"auth":"<token>"} first' } })
+    local s, err = socket.bind(settings.host, settings.port, settings.backlog)
+    trace('socket.bind => ' .. tostring(s) .. ' err=' .. tostring(err))
+    if not s then
+        print('[ai_bridge] bind failed: ' .. tostring(err))
         return
     end
-    if rate_limited(client) then
-        send_line(client, { jsonrpc = '2.0', id = rid,
-            error = { code = -32098, message = 'rate limited' } })
-        return
-    end
-    local m = methods[req.method]
-    if not m then
-        send_line(client, { jsonrpc = '2.0', id = rid,
-            error = { code = -32601, message = 'Method not found: ' .. tostring(req.method) } })
-        return
-    end
-    local ok, res = pcall(m, req.params, client)
-    if ok then
-        send_line(client, { jsonrpc = '2.0', id = rid, result = res })
-    else
-        send_line(client, { jsonrpc = '2.0', id = rid,
-            error = { code = -32000, message = tostring(res) } })
-    end
-end
-
-local function process_buffer(client)
-    while true do
-        local nl = client.buf:find('\n', 1, true)
-        if not nl then return end
-        local line = client.buf:sub(1, nl - 1)
-        client.buf = client.buf:sub(nl + 1)
-        line = line:gsub('\r$', '')
-        if #line > 0 then
-            local ok, req = pcall(decode, line)
-            if ok and type(req) == 'table' then
-                handle_request(client, req)
-            else
-                send_line(client, { jsonrpc = '2.0', id = nil,
-                    error = { code = -32700, message = 'Parse error' } })
-            end
-        end
-    end
-end
-
-local function poll_clients()
-    local i = 1
-    while i <= #state.clients do
-        local c = state.clients[i]
-        c.sock:settimeout(0)
-        local data, err, partial = c.sock:receive(4096)
-        if data then
-            c.buf = c.buf .. data
-            process_buffer(c)
-        elseif err == 'timeout' and partial and #partial > 0 then
-            c.buf = c.buf .. partial
-            process_buffer(c)
-        elseif err == 'closed' then
-            c.dead = true
-        end
-        if c.dead then
-            pcall(function() c.sock:close() end)
-            table.remove(state.clients, i)
-        else
-            i = i + 1
-        end
-    end
-end
-
-local function accept_clients()
-    if not state.listener then return end
-    state.listener:settimeout(0)
-    local sock, err = state.listener:accept()
-    while sock do
-        sock:settimeout(0)
-        if #state.clients >= (settings.max_clients or 4) then
-            -- DoS protection: refuse new connections once the cap is hit.
-            pcall(function()
-                sock:send('{"jsonrpc":"2.0","id":null,"error":{"code":-32099,"message":"too many clients"}}\n')
-                sock:close()
-            end)
-            print(chat.header(addon.name) ..
-                  chat.warning('refused: max_clients reached'))
-        else
-            state.clients[#state.clients+1] = {
-                sock = sock, buf = '', subscribed = {},
-                authed = (settings.token == ''),   -- no auth needed iff no token configured
-                rl_count = 0, rl_window_start = os.time(),
-            }
-            if settings.token == '' then
-                print(chat.header(addon.name) .. chat.warning(
-                    'client connected UNAUTHENTICATED (set settings.token to require auth)'))
-            else
-                print(chat.header(addon.name) .. chat.message('client connected; awaiting auth'))
-            end
-        end
-        sock, err = state.listener:accept()
-    end
-end
-
-local function broadcast_event(ev, payload)
-    local line = encode(setmetatable({ event = ev, unpack = nil }, { __index = payload })) .. '\n'
-    -- simpler: build merged table
-    local merged = { event = ev }
-    for k, v in pairs(payload or {}) do merged[k] = v end
-    line = encode(merged) .. '\n'
-    for _, c in ipairs(state.clients) do
-        if c.subscribed and c.subscribed[ev] then
-            local ok = pcall(function() c.sock:send(line) end)
-            if not ok then c.dead = true end
-        end
-    end
-end
-
--------------------------------------------------------------------------------
--- Chat tail capture
--------------------------------------------------------------------------------
-local function push_chat(mode, text)
-    state.chat_tail[#state.chat_tail+1] = {
-        mode = mode, text = text, ts = os.time(),
-    }
-    while #state.chat_tail > settings.chat_tail_max do
-        table.remove(state.chat_tail, 1)
-    end
-    broadcast_event('chat', { mode = mode, text = text })
-end
-
--------------------------------------------------------------------------------
--- Ashita hooks
--------------------------------------------------------------------------------
-ashita.events.register('load', 'ai_bridge_load', function()
-    local sock, err = socket.bind(settings.host, settings.port, settings.backlog)
-    if not sock then
-        print(chat.header(addon.name) .. chat.error('bind failed: ' .. tostring(err)))
-        return
-    end
-    sock:settimeout(0)
-    state.listener = sock
+    s:settimeout(0)
+    state.listener = s
     state.running  = true
-    print(chat.header(addon.name) .. chat.message(
-        ('listening on %s:%d'):format(settings.host, settings.port)))
+    trace('listening on ' .. settings.host .. ':' .. tostring(settings.port))
+    print('[ai_bridge] listening on ' .. settings.host .. ':' .. tostring(settings.port))
 end)
 
-ashita.events.register('unload', 'ai_bridge_unload', function()
+-- ---------------------------------------------------------------------------
+-- Unload event: close sockets
+-- ---------------------------------------------------------------------------
+ashita.register_event('unload', function()
+    trace('unload event')
     state.running = false
+    if state.listener then pcall(function() state.listener:close() end); state.listener = nil end
     for _, c in ipairs(state.clients) do pcall(function() c.sock:close() end) end
     state.clients = {}
-    if state.listener then pcall(function() state.listener:close() end) end
-    state.listener = nil
 end)
 
-ashita.events.register('d3d_present', 'ai_bridge_tick', function()
-    if not state.running then return end
-    accept_clients()
-    poll_clients()
-end)
+-- ---------------------------------------------------------------------------
+-- Render event: accept connections, pump I/O (non-blocking, every frame)
+-- ---------------------------------------------------------------------------
+ashita.register_event('render', function()
+    if not state.running or not state.listener then return end
 
-ashita.events.register('text_in', 'ai_bridge_text_in', function(e)
-    push_chat(e.mode, e.message_modified or e.message)
-end)
-
-ashita.events.register('command', 'ai_bridge_cmd', function(e)
-    local args = e.command:args()
-    if #args == 0 or (args[1] ~= '/aibridge' and args[1] ~= '/aib') then return end
-    e.blocked = true
-    if args[2] == 'status' then
-        print(chat.header(addon.name) .. chat.message(
-            ('clients=%d chat_tail=%d'):format(#state.clients, #state.chat_tail)))
-    elseif args[2] == 'kick' then
-        for _, c in ipairs(state.clients) do c.dead = true end
-        print(chat.header(addon.name) .. chat.message('kicked all clients'))
-    else
-        print(chat.header(addon.name) .. chat.message('commands: status | kick'))
+    -- Accept up to one new connection per frame
+    if #state.clients < settings.max_clients then
+        local nsock = state.listener:accept()
+        if nsock then
+            nsock:settimeout(0)
+            state.clients[#state.clients+1] = { sock = nsock, buf = '' }
+        end
     end
+
+    -- Pump each client
+    local keep = {}
+    for _, c in ipairs(state.clients) do
+        local alive = true
+        -- read available data
+        while true do
+            local data, err, partial = c.sock:receive(1024)
+            local chunk = data or partial
+            if chunk and chunk ~= '' then
+                c.buf = c.buf .. chunk
+            end
+            if not data then
+                if err == 'closed' then alive = false end
+                break -- timeout or closed
+            end
+        end
+        -- Process full lines
+        while true do
+            local nl = c.buf:find('\n', 1, true)
+            if not nl then break end
+            local line = c.buf:sub(1, nl - 1)
+            c.buf = c.buf:sub(nl + 1)
+            -- strip \r
+            line = line:gsub('\r$', '')
+            if line ~= '' then
+                local resp = handle_request(line)
+                pcall(function() c.sock:send(resp .. '\n') end)
+            end
+        end
+        if alive then keep[#keep+1] = c else pcall(function() c.sock:close() end) end
+    end
+    state.clients = keep
 end)
+
+-- ---------------------------------------------------------------------------
+-- Optional: capture chat lines into tail buffer
+-- ---------------------------------------------------------------------------
+ashita.register_event('incoming_text', function(mode, text)
+    if not text or text == '' then return false end
+    state.chat_tail[#state.chat_tail+1] = { mode = mode, text = text, ts = os.time() }
+    if #state.chat_tail > settings.chat_tail_max then
+        table.remove(state.chat_tail, 1)
+    end
+    return false -- don't filter
+end)
+
+trace('--- ai_bridge top-level end ---')
