@@ -1,4 +1,4 @@
-"""tools.py - the tool catalogue exposed to the local model.
+﻿"""tools.py - the tool catalogue exposed to the local model.
 
 Each tool is a `Tool` dataclass with a name, JSON-schema parameter definition,
 and a plain-Python handler. The schema doubles as both the OpenAI-style
@@ -15,7 +15,7 @@ import json
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional
 
-from .bridges import AdminAPIClient, AIBridgeClient, BridgeError
+from ..bridges import AdminAPIClient, AIBridgeClient, BridgeError
 
 
 @dataclass
@@ -209,3 +209,4 @@ def dispatch(tool: Tool, args_json: str) -> Dict[str, Any]:
     except Exception as e:  # pragma: no cover
         return {"error": f"{type(e).__name__}: {e}"}
     return {"result": result}
+
