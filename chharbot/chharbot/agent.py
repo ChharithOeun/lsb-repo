@@ -1,4 +1,4 @@
-"""agent.py - the ReAct-style loop that turns a local LLM into a chharbot.
+﻿"""agent.py - the ReAct-style loop that turns a local LLM into a chharbot.
 
 Flow per turn:
   1. Send messages + tool catalogue to the LLM.
@@ -29,9 +29,9 @@ _log = logging.getLogger("chharbot")
 DEFAULT_SYSTEM = """You are Chharbot, an assistant embedded in a LandSandBoat
 (FFXI private server) deployment. You have two ways to act:
 
-  - client_*     — drive the FFXI game client (read state, optionally type chat / target)
-  - server_*     — query the LSB server's database and map_server log
-  - version_sync_* — inspect or re-sync the login.lua <-> retail version
+  - client_*     â€” drive the FFXI game client (read state, optionally type chat / target)
+  - server_*     â€” query the LSB server's database and map_server log
+  - version_sync_* â€” inspect or re-sync the login.lua <-> retail version
 
 Rules of thumb:
   - Read before you act. When the user asks what's going on, call the
@@ -80,6 +80,15 @@ class Agent:
         if not any(m.get("role") == "system" for m in messages):
             messages.insert(0, {"role": "system", "content": self.cfg.system})
         messages.append({"role": "user", "content": user})
+
+        # ---- post-chunk auto-cleanup (autotrigger v0.2.1) ----
+        try:
+            from autotrigger.cleanup import run_if_milestone
+            import os as _os
+            run_if_milestone(user, workspace=_os.getcwd())
+        except Exception as _ce:
+            _log.debug("cleanup hook skipped: %s", _ce)
+        # ---- end auto-cleanup ----
 
         tool_trace: List[Dict[str, Any]] = []
         # ---- graphify auto-trigger (always-on, all drives) ----
@@ -152,3 +161,4 @@ class Agent:
 def run_once(prompt: str, cfg: AgentConfig) -> Dict[str, Any]:
     """One-shot helper, equivalent to `Agent(cfg).run(prompt)`."""
     return Agent(cfg).run(prompt)
+
