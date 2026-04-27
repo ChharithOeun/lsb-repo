@@ -82,6 +82,19 @@ class Agent:
         messages.append({"role": "user", "content": user})
 
         tool_trace: List[Dict[str, Any]] = []
+        # ---- graphify auto-trigger (always-on, all drives) ----
+        try:
+            from .tools.graphify_preflight import preflight as _gpf, discover_targets as _gdt
+            _pf = _gpf(prompt=user, targets=_gdt(), auto_build=True)
+            if _pf.context_block:
+                messages[-1]["content"] = _pf.context_block + "\n\n---\n\n" + user
+                _log.info("graphify_preflight: %s (conf=%.2f) injected %d chars",
+                          _pf.reason, _pf.confidence, len(_pf.context_block))
+            else:
+                _log.debug("graphify_preflight skip: %s (%s)", _pf.decision, _pf.reason)
+        except Exception as _gpe:
+            _log.warning("graphify_preflight skipped: %s", _gpe)
+        # ---- end graphify auto-trigger ----
         steps = 0
         final_content: Optional[str] = None
 
